@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+fixtures/large_workspace/
+native-run/
+local-run/
+worker/temp_workspace/

@@ -1,0 +1,62 @@
+# Illustrative only -- not deployed by the POC's docker-compose stack.
+# Shows what Phase 3 of Delegate Implementation Plan.md packages: the exact
+# same worker image the VM path runs (built from worker/Dockerfile), deployed
+# as a Kubernetes Deployment instead of a plain container. Demonstrates that
+# the protocol implementation in worker_app/ is deployment-shape-agnostic.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bp-agent-k8s-delegate-1
+  labels:
+    app: bp-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: bp-agent
+  template:
+    metadata:
+      labels:
+        app: bp-agent
+    spec:
+      containers:
+        - name: bp-agent
+          image: delegate-poc/worker:latest
+          env:
+            # rediss:// -- Redis is TLS-only and authenticates this pod by its delegate cert (CN -> ACL user)
+            - name: REDIS_URL
+              valueFrom:
+                secretKeyRef:
+                  name: bp-agent-config
+                  key: redis-url
+            - name: CONTROL_PLANE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: bp-agent-config
+                  key: control-plane-url
+            - name: TENANT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: bp-agent-config
+                  key: tenant-id
+            - name: DELEGATE_NAME
+              value: k8s-delegate-1
+            - name: DELEGATE_QUEUE
+              value: default
+          volumeMounts:
+            - name: delegate-certs
+              mountPath: /app/certs
+      volumes:
+        - name: delegate-certs
+          persistentVolumeClaim:
+            claimName: bp-agent-certs
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bp-agent-certs
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 64Mi

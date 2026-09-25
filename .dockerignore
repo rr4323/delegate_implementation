@@ -1,0 +1,12 @@
+# Local run state and dev secrets must never be baked into images: named
+# volumes get seeded from image contents on first mount, which would leak the
+# dev CA private key and stale delegates/certs into every container.
+native-run
+local-run
+**/.venv
+**/venv
+**/__pycache__
+**/*.pyc
+control_plane/ca
+control_plane/db
+control_plane/media

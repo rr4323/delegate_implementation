@@ -1,0 +1,226 @@
+name: delegate-poc
+
+x-redis-admin-tls: &redis_admin_tls
+  REDIS_URL: rediss://redis:6379/0
+  REDIS_TLS_CA: /app/ca/ca.crt
+  REDIS_TLS_CERT: /app/ca/redis_admin.crt
+  REDIS_TLS_KEY: /app/ca/redis_admin.key
+
+services:
+  # One-shot: creates the root CA and the Redis server + cp-admin client certs
+  # in ca_data before Redis starts (Redis needs its cert to boot; the control
+  # plane can't issue it if it depends on Redis).
+  pki_init:
+    build:
+      context: .
+      dockerfile: control_plane/Dockerfile
+    environment:
+      # Set these (comma-separated) to the address a remote delegate will
+      # actually reach this host at -- an IP, a DNS name, or both -- if it's
+      # not just "redis"/"restart_gateway"/"control_plane"/"localhost". Only
+      # takes effect the first time this runs against an empty ca_data
+      # volume; changing it later needs the matching *_server.crt/.key
+      # deleted from the volume to force reissuance. See delegates/ca.py.
+      REDIS_EXTRA_SAN_NAMES: "192.168.10.141"
+      CONTROL_PLANE_EXTRA_SAN_NAMES: "192.168.10.141"
+    volumes:
+      - ca_data:/app/ca
+    command: ["python", "manage.py", "init_ca"]
+    networks: [delegate_poc]
+
+  # TLS-only, client-cert-required, ACL-enforced. `default` user is off and
+  # every delegate gets its own ACL user scoped to delegate:<id>:*. See
+  # redis/redis.conf, redis/entrypoint.sh and README "Redis access control".
+  redis:
+    image: redis:8.6
+    entrypoint: ["/redis-entrypoint.sh"]
+    volumes:
+      - ./redis/entrypoint.sh:/redis-entrypoint.sh:ro
+      - ./redis/redis.conf:/etc/redis/redis.conf:ro
+      - ca_data:/certs:ro
+      - redis_data:/data
+    ports:
+      - "16379:6379"
+    depends_on:
+      pki_init:
+        condition: service_completed_successfully
+    networks: [delegate_poc]
+    healthcheck:
+      test: ["CMD", "redis-cli", "--tls", "--cacert", "/certs/ca.crt", "--cert", "/certs/redis_admin.crt", "--key", "/certs/redis_admin.key", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  control_plane:
+    build:
+      context: .
+      dockerfile: control_plane/Dockerfile
+    environment:
+      <<: *redis_admin_tls
+      RESTART_GATEWAY_CONTROL_URL: http://restart_gateway:8766
+      WORKSPACE_FIXTURES_DIR: /fixtures
+      DELEGATE_CERT_VALIDITY_DAYS: "1"
+      REGISTRATION_TOKEN_TTL_SECONDS: "300"
+      TRANSFER_WAIT_TIMEOUT_SECONDS: "15"
+    volumes:
+      - ca_data:/app/ca
+      - sqlite_data:/app/db
+      - media_data:/app/media
+      - ./fixtures:/fixtures:ro
+    ports:
+      - "18000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    networks: [delegate_poc]
+    command: ["./run_control_plane.sh"]
+
+  dispatcher:
+    build:
+      context: .
+      dockerfile: control_plane/Dockerfile
+    environment:
+      <<: *redis_admin_tls
+      WORKSPACE_FIXTURES_DIR: /fixtures
+    volumes:
+      - ca_data:/app/ca
+      - sqlite_data:/app/db
+      - media_data:/app/media
+      - ./fixtures:/fixtures:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      control_plane:
+        condition: service_started
+    networks: [delegate_poc]
+    command: ["./run_dispatcher.sh"]
+    restart: unless-stopped
+
+  # Control-plane side of the agent restart channel: accepts each delegate's
+  # agent_manager's *outbound* mTLS websocket and pushes RESTART down it.
+  restart_gateway:
+    build:
+      context: .
+      dockerfile: control_plane/Dockerfile
+    volumes:
+      - ca_data:/app/ca
+      - sqlite_data:/app/db
+    ports:
+      - "18765:8765"
+      - "18766:8766"
+    depends_on:
+      control_plane:
+        condition: service_started
+    networks: [delegate_poc]
+    command: ["./run_restart_gateway.sh"]
+    restart: unless-stopped
+
+  # Simulates a VM-mode delegate install (docker container == the VM path's
+  # unit of deployment). Same image as worker_k8s_sim -- only the deployment
+  # shape differs, per Goal 5 in Delegate POC.md.
+  worker_vm:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    environment:
+      REDIS_URL: rediss://redis:6379/0
+      CONTROL_PLANE_URL: http://control_plane:8000
+      TENANT_ID: tenant-demo
+      DELEGATE_NAME: vm-delegate-1
+      # Each delegate gets its own Celery queue -- sharing one queue between
+      # delegates means whichever worker dequeues a task first executes it
+      # under its own identity, which the control plane's ownership check
+      # then (correctly) rejects since it doesn't match the execution's
+      # assigned delegate. Matches the design doc: "task is placed onto the
+      # queue associated with that delegate."
+      DELEGATE_QUEUE: queue-vm-delegate-1
+      TRANSFER_WAIT_TIMEOUT_SECONDS: "15"
+      TRANSFER_MAX_RETRIES: "5"
+    volumes:
+      - worker_vm_certs:/app/certs
+    depends_on:
+      redis:
+        condition: service_healthy
+      control_plane:
+        condition: service_started
+    networks: [delegate_poc]
+    restart: unless-stopped
+
+  # Simulates a Kubernetes-mode delegate (see worker/k8s-deployment.yaml for
+  # what the real K8s manifest looks like). Identical image to worker_vm.
+  worker_k8s_sim:
+    build:
+      context: .
+      dockerfile: worker/Dockerfile
+    environment:
+      REDIS_URL: rediss://redis:6379/0
+      CONTROL_PLANE_URL: http://control_plane:8000
+      TENANT_ID: tenant-demo
+      DELEGATE_NAME: k8s-delegate-1
+      DELEGATE_QUEUE: queue-k8s-delegate-1
+      TRANSFER_WAIT_TIMEOUT_SECONDS: "15"
+      TRANSFER_MAX_RETRIES: "5"
+    volumes:
+      - worker_k8s_certs:/app/certs
+    depends_on:
+      redis:
+        condition: service_healthy
+      control_plane:
+        condition: service_started
+    networks: [delegate_poc]
+    restart: unless-stopped
+
+  # agent_manager for worker_vm: same "machine" (shares its cert volume),
+  # dials out to the restart gateway with the delegate's own client cert and
+  # restarts worker_vm when told to. The docker socket mount is what lets this
+  # POC sidecar restart a sibling container; on a real VM it would be systemd.
+  agent_manager_vm:
+    build:
+      context: .
+      dockerfile: agent_manager/Dockerfile
+    environment:
+      CONTROL_PLANE_WS_URL: wss://restart_gateway:8765
+      DELEGATE_COMPOSE_SERVICE: worker_vm
+    volumes:
+      - worker_vm_certs:/certs:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      restart_gateway:
+        condition: service_started
+      worker_vm:
+        condition: service_started
+    networks: [delegate_poc]
+    restart: unless-stopped
+
+  # agent_manager for worker_k8s_sim: same "machine" (shares its cert volume),
+  # dials out to the restart gateway with the delegate's own client cert and
+  # restarts worker_k8s_sim when told to. The docker socket mount is what lets this
+  # POC sidecar restart a sibling container; on a real VM it would be systemd.
+  agent_manager_k8s_sim:
+    build:
+      context: .
+      dockerfile: agent_manager/Dockerfile
+    environment:
+      CONTROL_PLANE_WS_URL: wss://restart_gateway:8765
+      DELEGATE_COMPOSE_SERVICE: worker_k8s_sim
+    volumes:
+      - worker_k8s_certs:/certs:ro
+      - /var/run/docker.sock:/var/run/docker.sock
+    depends_on:
+      restart_gateway:
+        condition: service_started
+      worker_k8s_sim:
+        condition: service_started
+    networks: [delegate_poc]
+    restart: unless-stopped
+
+volumes:
+  redis_data:
+  ca_data:
+  sqlite_data:
+  media_data:
+  worker_vm_certs:
+  worker_k8s_certs:
+
+networks:
+  delegate_poc:

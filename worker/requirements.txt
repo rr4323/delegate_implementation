@@ -1,0 +1,4 @@
+celery==5.4.0
+redis==5.0.4
+requests==2.31.0
+cryptography==42.0.5
